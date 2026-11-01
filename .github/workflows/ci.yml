@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '17 6 * * 1' # weekly, to catch drift in real-world sites and PHP releases
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: PHP ${{ matrix.php }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['7.0', '7.1', '7.2', '7.3', '7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: curl, intl
+          coverage: none
+
+      - name: Lint
+        run: php -l headpatrol.php
+
+      - name: Unit tests (SSRF defences, URL handling, analysers)
+        run: php tests/run.php
+
+      - name: Integration tests (local fixture server)
+        run: |
+          php -S 127.0.0.1:8099 tests/fixture/router.php >/dev/null 2>&1 &
+          sleep 1
+          php tests/integration.php
+
+      - name: Web mode refuses internal targets
+        run: |
+          php -S 127.0.0.1:8080 headpatrol.php >/dev/null 2>&1 &
+          sleep 1
+          for target in http://127.0.0.1/ http://169.254.169.254/latest/meta-data/ "http://[::1]/" http://10.0.0.1/ file:///etc/passwd; do
+            out=$(curl -s -G --data-urlencode "url=$target" --data-urlencode format=json http://127.0.0.1:8080/)
+            echo "$target -> $out" | tr -d '\n'; echo
+            echo "$out" | grep -q '"error"'
+          done
+
+  real-world:
+    name: Real-world scans
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: curl, intl
+          coverage: none
+      - name: Scan public sites (exercises DNS pinning and TLS verification)
+        run: |
+          for site in github.com example.com wikipedia.org; do
+            php headpatrol.php --json --fail-on=none "$site" > out.json
+            php -r '$r = json_decode(file_get_contents("out.json"), true); if (!isset($r["grade"])) { fwrite(STDERR, "scan failed: " . ($r["error"] ?? "unknown") . "\n"); exit(1); } printf("%-16s %-3s %3d/100  HTTP %d  %s\n", parse_url($r["final_url"], PHP_URL_HOST), $r["grade"], $r["score"], $r["status"], $r["ip"]);'
+          done
+      - name: Text report
+        run: php headpatrol.php --no-color --fail-on=none github.com
+
+  compatibility:
+    name: PHPCompatibility (7.0+)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          tools: phpcs
+          coverage: none
+      - name: Install PHPCompatibility
+        run: |
+          git clone --depth 1 --branch 9.3.5 https://github.com/PHPCompatibility/PHPCompatibility.git /tmp/phpcompat
+          phpcs --config-set installed_paths /tmp/phpcompat
+      - name: Check
+        run: phpcs --standard=PHPCompatibility --runtime-set testVersion 7.0- headpatrol.php tests/
